@@ -1,6 +1,7 @@
 #include "led_animation.h"
 #include "config.h"
 #include "motor_control.h"
+#include <esp_task_wdt.h>
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -176,9 +177,8 @@ void animationTask() {
   }
   
   strip.show();
+  esp_task_wdt_reset();  // strip.show() blocks ~37ms — feed watchdog to prevent silent reset
 }
-
-// Allow manual pattern selection
 void setLEDPattern(uint8_t pattern) {
   currentPattern = pattern % 7;
   animationStep = 0;

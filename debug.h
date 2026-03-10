@@ -16,7 +16,7 @@
 // 5 = Verbose (everything including ISR events)
 
 #ifndef DEBUG_LEVEL
-#define DEBUG_LEVEL 3  // Default to Info level
+#define DEBUG_LEVEL 5  // Default to Info level
 #endif
 
 // Runtime debug switches (can be toggled via commands)

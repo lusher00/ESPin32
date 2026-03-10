@@ -25,6 +25,7 @@
 #include "pov_display.h"
 #include "debug.h"
 
+
 // Packet parser for Serial
 PacketParser serialParser;
 
@@ -51,9 +52,19 @@ void setup() {
   initLEDs();
   initTelemetry();
   initPOV();
-  
-  // Load default test animation
+
+  // Load default animations — heap diagnostics to catch malloc failures
+  Serial.printf("[INFO] Free heap before animations: %u bytes\n", ESP.getFreeHeap());
   loadTestAnimation();
+  Serial.printf("[INFO] Free heap after rainbow:  %u bytes\n", ESP.getFreeHeap());
+  loadSpokesAnimation();
+  Serial.printf("[INFO] Free heap after spokes:   %u bytes\n", ESP.getFreeHeap());
+  loadBullseyeAnimation();
+  Serial.printf("[INFO] Free heap after bullseye: %u bytes\n", ESP.getFreeHeap());
+  loadSpiralAnimation();
+  Serial.printf("[INFO] Free heap after spiral:   %u bytes\n", ESP.getFreeHeap());
+  loadClockAnimation();
+  Serial.printf("[INFO] Free heap after clock:    %u bytes\n", ESP.getFreeHeap());
   
   Serial.println("\n=================================");
   Serial.println("READY - Waiting for connections");
@@ -64,18 +75,37 @@ void setup() {
 
 void loop() {
   heartbeatTask();
-  animationTask();
+  // Don't run the normal LED animation while POV is active —
+  // they share the same strip and animationTask calls strip.show() every 40ms
+  // which would block interrupts and fight with the POV column updates.
+  if (!getPOVEnable()) {
+    animationTask();
+  }
   sendTelemetryTask();
   calculateRPMTask();
   pidTask();
   handleSerialPackets();
   handleSerialCommands();
-  povDisplayTask();
   
+  if (povNeedsShow) {
+    povNeedsShow = false;
+    strip.show();
+  }
+
   // Print ISR stats periodically if encoder debug enabled
   if (debugFlags.encoder && (millis() - lastISRStatsPrint >= ISR_STATS_INTERVAL)) {
     printISRStats();
     lastISRStatsPrint = millis();
+  }
+
+  static unsigned long lastPovDebug = 0;
+  if (millis() - lastPovDebug > 1000) {
+    lastPovDebug = millis();
+    Serial.printf("[POV] enabled:%d col:%d frame:%d rev:%d\n",
+      getPOVEnable(),
+      povState.currentColumn,
+      povState.currentFrame,
+      povState.revolutionCount);
   }
 }
 
@@ -134,21 +164,22 @@ void povDisplayTask() {
 }
 
 void handleSerialPackets() {
+  static Packet serialPacket;
+  static uint8_t serialResponseBuffer[PACKET_MAX_LENGTH];
+  
   while (Serial.available()) {
     uint8_t byte = Serial.read();
     
-    Packet packet;
-    if (serialParser.processByte(byte, packet)) {
+    if (serialParser.processByte(byte, serialPacket)) {
       // Valid packet received
-      uint8_t responseBuffer[PACKET_MAX_LENGTH];
       size_t responseLength = 0;
       
       // Execute command with ACK enabled
-      executeCommand(packet, responseBuffer, &responseLength, true);
+      executeCommand(serialPacket, serialResponseBuffer, &responseLength, true);
       
       // Send response if generated
       if (responseLength > 0) {
-        Serial.write(responseBuffer, responseLength);
+        Serial.write(serialResponseBuffer, responseLength);
       }
     }
   }

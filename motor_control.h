@@ -19,11 +19,15 @@ extern float Kd;
 // Encoder variables
 extern volatile unsigned long encoderCount;
 extern volatile unsigned long validPulseCount;
-extern unsigned long avgPulseWidth;
+extern volatile unsigned long avgPulseWidth;
+extern volatile unsigned long avgVoidWidth;
 extern bool pidEnabled;
+extern bool directPWMMode;
 
 // Function prototypes
 void initMotorControl();
+void startPOVTimer(unsigned long periodUs);
+void stopPOVTimer();
 void handleMotorCommand(char cmd, int value);  // Legacy - for BLE backward compatibility
 void calculateRPMTask();
 void pidTask();
@@ -54,3 +58,6 @@ void getStatusData(struct StatusData& status);
 void IRAM_ATTR encoderISR();
 
 #endif // MOTOR_CONTROL_H
+
+// POV show flag — set by ISR, cleared by main loop
+extern volatile bool povNeedsShow;

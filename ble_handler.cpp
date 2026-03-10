@@ -2,6 +2,7 @@
 #include "motor_control.h"
 #include "config.h"
 #include "commands.h"
+#include "telemetry.h"
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pMotorCharacteristic = NULL;
@@ -10,6 +11,12 @@ bool deviceConnected = false;
 
 // Packet parser for BLE
 PacketParser bleParser;
+
+// Static buffers to avoid stack overflow in BLE callback task.
+// Packet.payload is 1018 bytes and responseBuffer is 1024 bytes — putting
+// both on the BLE task stack (~4KB total) reliably crashes the ESP32.
+static Packet blePacket;
+static uint8_t bleResponseBuffer[PACKET_MAX_LENGTH];
 
 class ServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
@@ -31,22 +38,20 @@ class MotorCallbacks: public BLECharacteristicCallbacks {
     if (value.length() > 0) {
       // Try packet protocol first
       bool packetReceived = false;
-      Packet packet;
       
       for (size_t i = 0; i < value.length(); i++) {
-        if (bleParser.processByte(value[i], packet)) {
+        if (bleParser.processByte(value[i], blePacket)) {
           packetReceived = true;
           
           // Execute command
-          uint8_t responseBuffer[PACKET_MAX_LENGTH];
           size_t responseLength = 0;
           
-          executeCommand(packet, responseBuffer, &responseLength, true);
+          executeCommand(blePacket, bleResponseBuffer, &responseLength, true);
           
-          // Send response via telemetry characteristic if generated
-          if (responseLength > 0 && pTelemetryCharacteristic) {
-            pTelemetryCharacteristic->setValue(responseBuffer, responseLength);
-            pTelemetryCharacteristic->notify();
+          // Send response via the mutex-protected helper to avoid
+          // racing with the telemetry task's notify() call.
+          if (responseLength > 0) {
+            bleSendResponse(bleResponseBuffer, responseLength);
           }
         }
       }
@@ -104,7 +109,7 @@ void initBLE() {
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
   pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
   
   Serial.println("✓ BLE Server started");

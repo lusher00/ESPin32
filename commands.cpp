@@ -444,6 +444,7 @@ bool executeCommand(const Packet& packet, uint8_t* responseBuffer, size_t* respo
     }
     
     case CMD_SET_POV_ENABLE: {
+      Serial.printf("[CMD] POV_ENABLE received, payload[0]=%d\n", packet.payload[0]);
       if (packet.payloadLength != 1) {
         if (sendAck) {
           *responseLength = buildNackPacket(responseBuffer, packet.command, ERR_INVALID_LENGTH);
@@ -453,6 +454,9 @@ bool executeCommand(const Packet& packet, uint8_t* responseBuffer, size_t* respo
       
       bool enable = (packet.payload[0] != 0);
       setPOVEnable(enable);
+      
+      // In setPOVEnable:
+      Serial.printf("[POV] enable set to %d\n", enable);
       
       if (sendAck) {
         *responseLength = buildAckPacket(responseBuffer, packet.command);
@@ -508,7 +512,7 @@ bool executeCommand(const Packet& packet, uint8_t* responseBuffer, size_t* respo
       
       if (!uploadFrameData(frameNum, column, rgbData)) {
         if (sendAck) {
-          *responseLength = buildNackPacket(responseBuffer, packet.command, ERR_INVALID_PAYLOAD);
+          *responseLength = buildNackPacket(responseBuffer, packet.command, ERR_OUT_OF_RANGE);
         }
         return false;
       }
@@ -572,16 +576,24 @@ bool executeCommand(const Packet& packet, uint8_t* responseBuffer, size_t* respo
     }
     
     case CMD_GET_ISR_STATS: {
-      // Build stats packet: 6 uint32 values
+      // Snapshot volatile ISR counters into locals first — memcpy can't
+      // accept volatile pointers directly.
+      uint32_t s0 = isrDebugCounters.encoder_transitions;
+      uint32_t s1 = isrDebugCounters.sync_pulses;
+      uint32_t s2 = isrDebugCounters.debounce_rejects;
+      uint32_t s3 = isrDebugCounters.pov_updates;
+      uint32_t s4 = isrDebugCounters.last_pulse_width;
+      uint32_t s5 = isrDebugCounters.last_avg_pulse_width;
+
       uint8_t stats[24];
-      memcpy(&stats[0], &isrDebugCounters.encoder_transitions, 4);
-      memcpy(&stats[4], &isrDebugCounters.sync_pulses, 4);
-      memcpy(&stats[8], &isrDebugCounters.debounce_rejects, 4);
-      memcpy(&stats[12], &isrDebugCounters.pov_updates, 4);
-      memcpy(&stats[16], &isrDebugCounters.last_pulse_width, 4);
-      memcpy(&stats[20], &isrDebugCounters.last_avg_pulse_width, 4);
+      memcpy(&stats[0],  &s0, 4);
+      memcpy(&stats[4],  &s1, 4);
+      memcpy(&stats[8],  &s2, 4);
+      memcpy(&stats[12], &s3, 4);
+      memcpy(&stats[16], &s4, 4);
+      memcpy(&stats[20], &s5, 4);
       
-      *responseLength = buildPacket(responseBuffer, CMD_STATUS_RESPONSE, stats, 24);
+      *responseLength = buildPacket(responseBuffer, CMD_ISR_STATS_RESPONSE, stats, 24);
       return true;
     }
     

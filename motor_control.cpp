@@ -30,9 +30,17 @@ volatile unsigned long validPulseCount = 0;
 volatile unsigned long lastInterruptTime = 0;
 volatile unsigned long pulseWidth = 0;
 volatile bool syncDetected = false;
+bool rpmFresh = false;
 volatile unsigned long syncPulseWidth = 0;
-unsigned long avgPulseWidth = 0;
+volatile unsigned long avgPulseWidth = 0;    // Average post width
+volatile unsigned long avgVoidWidth = 0;     // Average void width (for sync detection)
+volatile unsigned long allTransitionAvg = 0; // Average of ALL transitions (for RPM)
+volatile unsigned long avgRisingWidth = 0;
+volatile unsigned long avgFallingWidth = 0;
+volatile unsigned long lastRisingTime = 0;
+volatile unsigned long lastFallingTime = 0;
 bool pidEnabled = false;
+bool directPWMMode = false;   // When true, pidTask() will not touch the PWM pin
 
 // RPM calculation
 unsigned long lastRPMCalc = 0;
@@ -42,64 +50,143 @@ unsigned long lastEncoderCount = 0;
 unsigned long lastBeat = 0;
 bool beatState = false;
 
-void IRAM_ATTR encoderISR() {
-  unsigned long currentTime = micros();
-  
-  // Debounce
-  if (currentTime - lastInterruptTime < DEBOUNCE_US) {
-    isrDebugCounters.debounce_rejects++;
+// ── POV COLUMN TIMER ──
+// Hardware timer fires every (revolution_period / POV_COLUMNS) to advance column.
+hw_timer_t* povTimer = nullptr;
+volatile bool povTimerRunning = false;
+
+volatile bool povNeedsShow = false;
+
+void IRAM_ATTR povTimerISR() {
+  if (!getPOVEnable()) return;
+  if (allTransitionAvg == 0) return;
+  povState.currentColumn = (povState.currentColumn + 1) % POV_COLUMNS;
+  displayPOVColumn();
+  povNeedsShow = true;  // signal main loop
+}
+
+
+void startPOVTimer(unsigned long periodUs) {
+  // periodUs is the full revolution period in microseconds.
+  // Reject implausibly short periods (< 10ms = > 6000 RPM) or zero.
+  if (periodUs == 0 || periodUs < 10000) {
+    Serial.printf("[POV] startPOVTimer rejected bad period: %lu\n", periodUs);
     return;
   }
   
-  // Calculate pulse width
-  pulseWidth = currentTime - lastInterruptTime;
+  uint64_t columnUs = periodUs / POV_COLUMNS;
+  // Per-column minimum: 200µs = ~5000 columns/sec. Protects timer hardware.
+  if (columnUs < 200) columnUs = 200;
+
+  if (povTimer == nullptr) {
+    povTimer = timerBegin(0, 80, true);
+    timerAttachInterrupt(povTimer, &povTimerISR, true);
+  }
+  timerAlarmDisable(povTimer);        // stop before reconfiguring
+  timerAlarmWrite(povTimer, columnUs, true);
+  timerAlarmEnable(povTimer);
+  povTimerRunning = true;
+}
+
+void stopPOVTimer() {
+  if (povTimer != nullptr) {
+    timerAlarmDisable(povTimer);
+    timerDetachInterrupt(povTimer);
+    timerEnd(povTimer);
+    povTimer = nullptr;             // force full reinit on next start
+  }
+  povTimerRunning = false;
+}
+
+void IRAM_ATTR encoderISR() {
+  unsigned long currentTime = micros();
+
+  // Debounce — single flag disk, pulses should be ~60ms apart at 1000RPM
+  // Use a generous debounce to reject noise but not real pulses
+  if (currentTime - lastInterruptTime < 5000) { // 5ms minimum between pulses
+    isrDebugCounters.debounce_rejects++;
+    return;
+  }
+
+  // Measure revolution period
+  unsigned long period = currentTime - lastInterruptTime;
   lastInterruptTime = currentTime;
-  
-  // Always count total transitions
   encoderCount++;
+  validPulseCount++;
   isrDebugCounters.encoder_transitions++;
-  
-  // Check if this looks like a sync pulse
-  bool isSync = false;
-  if (avgPulseWidth > 0 && pulseWidth > (avgPulseWidth * SYNC_THRESHOLD)) {
-    isSync = true;
-    syncDetected = true;
-    syncPulseWidth = pulseWidth;
-    isrDebugCounters.sync_pulses++;
-  } else {
-    // Valid pulse - count it and update running average
-    validPulseCount++;
-    
-    // Update average pulse width (simple moving average)
-    if (avgPulseWidth == 0) {
-      avgPulseWidth = pulseWidth;
+
+  // Smooth period with EMA (16-sample)
+  if (allTransitionAvg == 0) allTransitionAvg = period;
+  else allTransitionAvg = (allTransitionAvg * 15 + period) / 16;
+
+  // Update RPM
+  // period is microseconds per revolution
+  // RPM = 60,000,000 / period
+  isrDebugCounters.last_pulse_width = period;
+
+  // Reset POV to column 0 (sync) and restart column timer with new period
+  if (getPOVEnable()) {
+    povEncoderUpdate();  // resets column 0, advances frame
+
+    // Restart timer with updated period.
+    // If the timer was torn down (stopPOVTimer nulls povTimer), recreate it.
+    uint64_t columnUs = allTransitionAvg / POV_COLUMNS;
+    if (columnUs < 500) columnUs = 500;
+    if (povTimer == nullptr) {
+      povTimer = timerBegin(0, 80, true);
+      timerAttachInterrupt(povTimer, &povTimerISR, true);
+      timerAlarmWrite(povTimer, columnUs, true);
+      timerAlarmEnable(povTimer);
+      povTimerRunning = true;
     } else {
-      avgPulseWidth = (avgPulseWidth * 9 + pulseWidth) / 10;
+      timerAlarmWrite(povTimer, columnUs, true);
     }
   }
-  
-  // Update debug counters (ISR-safe)
-  isrDebugCounters.last_pulse_width = pulseWidth;
-  isrDebugCounters.last_avg_pulse_width = avgPulseWidth;
-  
-  // Update POV display
-  povEncoderUpdate(isSync);
-  isrDebugCounters.pov_updates++;
+}
+
+// Write PWM to the correct H-bridge leg based on direction.
+// DRV8871: IN1 and IN2 are independent direction+PWM inputs.
+//   Forward fast decay: IN1=PWM, IN2=LOW
+//   Reverse fast decay: IN1=LOW, IN2=PWM
+//   Coast:              IN1=LOW, IN2=LOW
+//   Brake:              IN1=HIGH, IN2=HIGH (avoid)
+static void applyMotorPWM(int pwm) {
+  pwm = constrain(pwm, 0, 255);
+  if (pwm == 0) {
+    ledcWrite(MOTOR_PWM_CHANNEL_A, 0);
+    ledcWrite(MOTOR_PWM_CHANNEL_B, 0);
+    return;
+  }
+  if (motorDirection) {
+    ledcWrite(MOTOR_PWM_CHANNEL_A, pwm);
+    ledcWrite(MOTOR_PWM_CHANNEL_B, 0);
+  } else {
+    ledcWrite(MOTOR_PWM_CHANNEL_A, 0);
+    ledcWrite(MOTOR_PWM_CHANNEL_B, pwm);
+  }
 }
 
 void initMotorControl() {
   // Load saved configuration
   loadConfig();
   
-  // Configure motor pins
+  // Both H-bridge legs are outputs. Start coasting (both LOW).
   pinMode(MOTOR_PWM_PIN, OUTPUT);
   pinMode(MOTOR_DIR_PIN, OUTPUT);
-  digitalWrite(MOTOR_DIR_PIN, motorDirection ? HIGH : LOW);
+  digitalWrite(MOTOR_PWM_PIN, LOW);
+  digitalWrite(MOTOR_DIR_PIN, LOW);
+
+  // Configure LEDC for both H-bridge pins at 20kHz
+  ledcSetup(MOTOR_PWM_CHANNEL_A, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  ledcSetup(MOTOR_PWM_CHANNEL_B, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  ledcAttachPin(MOTOR_PWM_PIN, MOTOR_PWM_CHANNEL_A);
+  ledcAttachPin(MOTOR_DIR_PIN, MOTOR_PWM_CHANNEL_B);
+
   DEBUG_INFO("✓ Motor pins configured");
   
   // Configure encoder pin with pullup and interrupt
   pinMode(ENCODER_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, RISING);
   DEBUG_INFOF("✓ Encoder interrupt attached (Pin %d)", ENCODER_PIN);
   
   // Configure heartbeat
@@ -118,9 +205,8 @@ void handleMotorCommand(char cmd, int value) {
       
     case 'D': // Set direction (0=backward, 1=forward)
       motorDirection = (value != 0);
-      digitalWrite(MOTOR_DIR_PIN, motorDirection ? HIGH : LOW);
+      applyMotorPWM(0);  // Re-latch direction pins at zero speed
       DEBUG_MOTORF("Direction: %s", motorDirection ? "FORWARD" : "BACKWARD");
-      
       saveConfig();
       break;
       
@@ -189,20 +275,21 @@ void saveConfig() {
 void loadConfig() {
   prefs.begin("motor", true);
   
-  Kp = prefs.getFloat("Kp", 2.0);
-  Ki = prefs.getFloat("Ki", 0.5);
-  Kd = prefs.getFloat("Kd", 0.1);
+  Kp = prefs.getFloat("Kp", 1.1);
+  Ki = prefs.getFloat("Ki", 0.46);
+  Kd = prefs.getFloat("Kd", 0.2);
   targetRPM = prefs.getFloat("targetRPM", 0.0);
   motorDirection = prefs.getBool("motorDir", true);
   
   prefs.end();
   
   DEBUG_INFO("✓ Config loaded from flash");
+}
 
 void resetConfig() {
-  Kp = 2.0;
-  Ki = 0.5;
-  Kd = 0.1;
+  Kp = 1.1;
+  Ki = 0.46;
+  Kd = 0.2;
   targetRPM = 0.0;
   motorDirection = true;
   
@@ -211,53 +298,86 @@ void resetConfig() {
 
 void calculateRPMTask() {
   if (millis() - lastRPMCalc >= RPM_INTERVAL) {
-    unsigned long pulses = validPulseCount - lastEncoderCount;
-    lastEncoderCount = validPulseCount;
-    
-    // RPM = (pulses / TRANSITIONS_PER_REV) * (60000 / interval_ms)
-    currentRPM = (float)pulses / VALID_TRANSITIONS_PER_REV * (60000.0 / RPM_INTERVAL);
-    
+    noInterrupts();
+    unsigned long avgTrans = allTransitionAvg;
+    unsigned long snapshot = validPulseCount;
+    interrupts();
+
+    // RPM from average inter-transition time — uses all 34 transitions per rev.
+    // Smoother than post-only because it has 2x the sample rate.
+    if (avgTrans > 0) {
+      currentRPM = 60000000.0f / (float)avgTrans;  // single pulse per revolution
+    } else {
+      currentRPM = 0;
+    }
+
+    // Zero out if no pulses arrived this interval (motor stopped)
+    unsigned long pulses = snapshot - lastEncoderCount;
+    lastEncoderCount = snapshot;
+    if (pulses == 0) currentRPM = 0;
+
     lastRPMCalc = millis();
-    
-    // Enable PID once we have stable pulse width measurements
-    if (!pidEnabled && validPulseCount > 20 && avgPulseWidth > 0) {
+    rpmFresh = true;   // Signal pidTask that a new reading is ready
+
+    // Auto-enable PID once encoder is stable
+    if (!pidEnabled && !directPWMMode && snapshot > 20 && avgTrans > 0 && targetRPM > 0) {
+      pidEnabled = true;
+      errorSum = 0;
+      lastError = 0;
+      DEBUG_INFO("PID auto-enabled after stable encoder readings");
+    }
+  }
+}
 
 void pidTask() {
   if (millis() - lastPIDUpdate >= PID_INTERVAL) {
-    
+
+    // Direct PWM mode: PID doesn't touch the pin, but motor kill / E-stop still work
+    if (directPWMMode) {
+      if (!motorEnabled) applyMotorPWM(0);
+      lastPIDUpdate = millis();
+      return;
+    }
+
     // Only run PID if enabled AND motor is enabled
     if (!pidEnabled || !motorEnabled) {
       errorSum = 0;
       lastError = 0;
       pwmOutput = 0;
-      analogWrite(MOTOR_PWM_PIN, 0);
+      applyMotorPWM(0);
       lastPIDUpdate = millis();
       return;
     }
-    
-    // Calculate error
+
+    // Only update PID when a fresh RPM reading is available
+    // to avoid accumulating integral on stale data
+    if (!rpmFresh) {
+      lastPIDUpdate = millis();
+      return;
+    }
+    rpmFresh = false;
+
     float error = targetRPM - currentRPM;
-    
-    // Proportional term
+
+    // Proportional
     float P = Kp * error;
-    
-    // Integral term
-    errorSum += error * (PID_INTERVAL / 1000.0);
-    errorSum = constrain(errorSum, -100, 100); // Anti-windup
+
+    // Integral with anti-windup
+    errorSum += error * (RPM_INTERVAL / 1000.0f);
+    errorSum = constrain(errorSum, -500, 500);
     float I = Ki * errorSum;
-    
-    // Derivative term
-    float D = Kd * (error - lastError) / (PID_INTERVAL / 1000.0);
+
+    // Derivative - scaled by interval in seconds
+    float D = Kd * (error - lastError) / (RPM_INTERVAL / 1000.0f);
     lastError = error;
-    
-    // Calculate output
+
     pwmOutput = P + I + D;
     pwmOutput = constrain(pwmOutput, 0, 255);
-    
-    // Apply to motor
-    analogWrite(MOTOR_PWM_PIN, (int)pwmOutput);
-    
+
+    applyMotorPWM((int)pwmOutput);
     lastPIDUpdate = millis();
+  }
+}
 
 void heartbeatTask() {
   if (millis() - lastBeat >= HEARTBEAT_INTERVAL) {
@@ -280,9 +400,8 @@ void setTargetRPM(float rpm) {
 
 void setMotorDirection(bool forward) {
   motorDirection = forward;
-  digitalWrite(MOTOR_DIR_PIN, motorDirection ? HIGH : LOW);
+  applyMotorPWM(0);  // Re-latch direction pins at zero speed
   DEBUG_MOTORF("Direction: %s", motorDirection ? "FORWARD" : "BACKWARD");
-  
   saveConfig();
 }
 
@@ -292,9 +411,9 @@ void setMotorEnable(bool enable) {
 }
 
 void setDirectPWM(uint8_t pwm) {
-  // Direct PWM mode bypasses PID
+  directPWMMode = true;
   pidEnabled = false;
-  analogWrite(MOTOR_PWM_PIN, pwm);
+  applyMotorPWM(pwm);
   pwmOutput = pwm;
   DEBUG_MOTORF("Direct PWM set to: %d", pwm);
 }
@@ -302,14 +421,29 @@ void setDirectPWM(uint8_t pwm) {
 void emergencyStop() {
   motorEnabled = false;
   pidEnabled = false;
-  analogWrite(MOTOR_PWM_PIN, 0);
+  directPWMMode = false;
+  applyMotorPWM(0);
   pwmOutput = 0;
   DEBUG_ERROR("EMERGENCY STOP");
 }
 
 void setPIDEnable(bool enable) {
-  pidEnabled = enable;
-  DEBUG_MOTORF("PID %s", enable ? "ENABLED" : "DISABLED");
+  if (enable) {
+    // Switching to PID mode: leave direct PWM, reset integrator
+    directPWMMode = false;
+    pidEnabled = true;
+    errorSum = 0;
+    lastError = 0;
+    DEBUG_MOTOR("PID ENABLED");
+  } else {
+    // Switching to Direct PWM mode: stop PID output, arm directPWMMode
+    // so pidTask() won't zero the pin when the slider is moved.
+    pidEnabled = false;
+    directPWMMode = true;
+    applyMotorPWM(0);
+    pwmOutput = 0;
+    DEBUG_MOTOR("PID DISABLED (direct PWM mode)");
+  }
 }
 
 void setKp(float kp) {

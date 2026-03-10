@@ -11,20 +11,21 @@
 // [START_BYTE] [LENGTH] [COMMAND] [PAYLOAD...] [CRC16_HIGH] [CRC16_LOW] [END_BYTE]
 //
 // START_BYTE: 0xAA (1 byte)
-// LENGTH: Total packet length including start/end (1 byte)
+// LENGTH: Total packet length including start/end bytes (1 byte, max 255)
 // COMMAND: Command ID (1 byte)
-// PAYLOAD: 0-1018 bytes of data
+// PAYLOAD: 0-249 bytes of data  (255 - 6 overhead bytes)
 // CRC16: CRC-16/XMODEM checksum (2 bytes, big-endian)
 // END_BYTE: 0x55 (1 byte)
 //
 // Minimum packet: 6 bytes (no payload)
-// Maximum packet: 1024 bytes (1018 bytes payload)
+// Maximum packet: 255 bytes (249 bytes payload)
+// NOTE: LENGTH is a single byte, so total packet cannot exceed 255 bytes.
 
 #define PACKET_START_BYTE    0xAA
 #define PACKET_END_BYTE      0x55
 #define PACKET_MIN_LENGTH    6
-#define PACKET_MAX_LENGTH    1024
-#define PACKET_MAX_PAYLOAD   1018
+#define PACKET_MAX_LENGTH    255
+#define PACKET_MAX_PAYLOAD   249
 
 // Packet parser states
 enum PacketState {
@@ -103,6 +104,7 @@ enum PacketState {
 #define CMD_ENCODER_RESPONSE     0x85  // Payload: 2 uint32 (total count, valid count)
 #define CMD_REVOLUTION_RESPONSE  0x86  // Payload: uint32 (revolution count)
 #define CMD_FRAME_RESPONSE       0x87  // Payload: uint16 (current frame number)
+#define CMD_ISR_STATS_RESPONSE   0x88  // Payload: 6x uint32 (ISR counters)
 
 // Error Codes for NACK
 #define ERR_INVALID_COMMAND      0x01
@@ -148,7 +150,7 @@ struct __attribute__((packed)) StatusData {
 // POV DISPLAY STRUCTURES
 // ============================================================================
 
-#define POV_COLUMNS 34          // Columns per revolution (matches encoder transitions)
+#define POV_COLUMNS 72          // Columns per revolution (CHANGE mode = 34 transitions/rev)
 #define POV_LEDS 34             // LEDs in the strip
 #define MAX_POV_FRAMES 128      // Maximum frames per animation
 #define MAX_ANIMATIONS 8        // Maximum number of stored animations
