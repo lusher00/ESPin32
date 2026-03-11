@@ -18,11 +18,9 @@ A robust motor control system with PID feedback, multi-interface command protoco
 ## Hardware Setup
 
 ### Encoder Disk Geometry
-- **16 standard posts**: 12° wide each
-- **1 wide post**: 20° wide (sync marker)
-- **16 standard voids**: 8° wide each
-- **1 wide void**: 20° wide (sync pulse)
-- **Total**: 34 transitions per revolution
+- **1 post**: 20° wide
+- **sync pulse falling edge**: LED bar @180° 
+- **sync pulse rising edge**: LED bar @200°
 
 ### Pin Assignments
 - **ENCODER_PIN** (A5): Encoder input (requires external 10kΩ pull-up to 3.3V)
